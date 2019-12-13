@@ -17,6 +17,7 @@ package reflectutils
 import (
 	"reflect"
 	"strings"
+	"sync"
 
 	"yunion.io/x/pkg/gotypes"
 	"yunion.io/x/pkg/utils"
@@ -85,7 +86,8 @@ func (info *SStructFieldInfo) MarshalName() string {
 	if len(info.Name) > 0 {
 		return info.Name
 	}
-	return utils.CamelSplit(info.FieldName, "_")
+	info.Name = utils.CamelSplit(info.FieldName, "_")
+	return info.Name
 }
 
 type SStructFieldValue struct {
@@ -188,4 +190,165 @@ func (set SStructFieldValueSet) GetInterface(name string) (interface{}, bool) {
 		return set[idx].Value.Interface(), true
 	}
 	return nil, false
+}
+
+func (set SStructFieldValueSetV2) GetValue(name string) (reflect.Value, bool) {
+	idx := set.getStructFieldIndex(name)
+	if idx < 0 {
+		return reflect.Value{}, false
+	}
+	return set.Values[idx].Value, true
+}
+
+func (set SStructFieldValueSetV2) GetInterface(name string) (interface{}, bool) {
+	idx := set.getStructFieldIndex(name)
+	if idx < 0 {
+		return nil, false
+	}
+	if set.Values[idx].Value.CanInterface() {
+		return set.Values[idx].Value.Interface(), true
+	}
+	return nil, false
+}
+
+func (set SStructFieldValueSetV2) getStructFieldIndex(name string) int {
+	index := -1
+	for i, jsonInfo := range set.Infos {
+		if jsonInfo.MarshalName() == name {
+			index = i
+			break
+		}
+		if utils.CamelSplit(jsonInfo.FieldName, "_") == utils.CamelSplit(name, "_") {
+			index = i
+			break
+		}
+		if jsonInfo.FieldName == name {
+			index = i
+			break
+		}
+		if jsonInfo.FieldName == utils.Capitalize(name) {
+			index = i
+			break
+		}
+	}
+	if index < 0 {
+		return index
+	}
+	if index >= len(set.Values) {
+		index = len(set.Values) - 1
+	}
+	// Reverse traversal from index will be faster
+	for i := index; i >= 0; i-- {
+		if set.Values[i].Index == index {
+			return i
+		}
+	}
+	// no arrival
+	return index
+}
+
+type SStructFieldValueSetV2 struct {
+	Infos []SStructFieldInfo
+	Values []SStructFieldValueV2
+}
+
+type SStructFieldValueV2 struct {
+	Value reflect.Value
+	Index int
+}
+
+func FetchStructFieldValueSetV2(dataValue reflect.Value) SStructFieldValueSetV2 {
+	infos := cachefetchStructFieldInfos(dataValue)
+	values, _ := fetchStructFieldValueV2s(dataValue, false, 0)
+	return SStructFieldValueSetV2{infos, values}
+}
+
+func FetchStructFieldValueSetForWriteV2(dataValue reflect.Value) SStructFieldValueSetV2 {
+	infos := cachefetchStructFieldInfos(dataValue)
+	values, _ := fetchStructFieldValueV2s(dataValue, true, 0)
+	return SStructFieldValueSetV2{infos, values}
+}
+
+var structFieldInfoCache sync.Map
+
+func cachefetchStructFieldInfos(dataValue reflect.Value) []SStructFieldInfo {
+	dataType := dataValue.Type()
+	if r, ok := structFieldInfoCache.Load(dataType); ok {
+		return r.([]SStructFieldInfo)
+	}
+	f, _ := structFieldInfoCache.LoadOrStore(dataType, fetchStructFieldInfos(dataValue))
+	return f.([]SStructFieldInfo)
+}
+
+func fetchStructFieldInfos(dataValue reflect.Value) []SStructFieldInfo {
+	dataType := dataValue.Type()
+	ret := make([]SStructFieldInfo, 0, dataType.NumField())
+	for i := 0; i < dataType.NumField(); i += 1 {
+		sf := dataType.Field(i)
+		if !gotypes.IsFieldExportable(sf.Name) {
+			continue
+		}
+		fv := dataValue.Field(i)
+		if sf.Anonymous {
+			if !fv.IsValid() {
+				continue
+			}
+			if fv.Kind() == reflect.Ptr {
+				if fv.IsNil() {
+					fv.Set(reflect.New(fv.Type().Elem()))
+				}
+				fv = fv.Elem()
+			}
+			if fv.Kind() == reflect.Interface {
+				fv = fv.Elem()
+			}
+			if fv.Kind() == reflect.Struct && sf.Type != gotypes.TimeType{
+			 	subInfo := fetchStructFieldInfos(fv)
+			 	ret = append(ret, subInfo...)
+			 	continue
+		 }
+		}
+		jsonInfo := ParseStructFieldJsonInfo(sf)
+		ret = append(ret, jsonInfo)
+	}
+	return ret[:len(ret):len(ret)]
+}
+
+func fetchStructFieldValueV2s(dataValue reflect.Value, allocatePtr bool, index int) ([]SStructFieldValueV2, int) {
+	dataType := dataValue.Type()
+	ret := make([]SStructFieldValueV2, 0, dataType.NumField())
+	for i := 0; i < dataType.NumField(); i += 1 {
+		sf := dataType.Field(i)
+
+		if !gotypes.IsFieldExportable(sf.Name) {
+			continue
+		}
+		fv := dataValue.Field(i)
+		if sf.Anonymous {
+			switch fv.Kind() {
+			case reflect.Ptr, reflect.Interface:
+				if !fv.IsValid() {
+					continue
+				}
+				if fv.IsNil() {
+					if fv.Kind() == reflect.Ptr && allocatePtr {
+						fv.Set(reflect.New(fv.Type().Elem()))
+					} else {
+						index += 1
+						continue
+					}
+				}
+				fv = fv.Elem()
+			}
+			if fv.Kind() == reflect.Struct && sf.Type != gotypes.TimeType {
+				var subValues []SStructFieldValueV2
+				subValues, index = fetchStructFieldValueV2s(fv, allocatePtr, index)
+				ret = append(ret, subValues...)
+				continue
+			}
+		}
+		ret = append(ret, SStructFieldValueV2{fv, index})
+		index += 1
+	}
+	return ret, index
 }
